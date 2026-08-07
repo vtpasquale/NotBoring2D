@@ -7,6 +7,7 @@ Created on Sun Aug  2 10:56:27 2026
 """
 
 import numpy as np
+from notboring2d.TriMesh import TriMesh
 
 def read_su2_mesh_2d(filepath):
     """
@@ -100,3 +101,31 @@ def read_su2_mesh_2d(filepath):
         raise ValueError("Mesh file missing NPOIN or NELEM section.")
 
     return {'ndim': ndim, 'points': points, 'elems': elems, 'markers': markers}
+
+
+def su2_to_trimesh(filepath: str) -> "TriMesh":
+    """
+    Build a TriMesh from a 2D SU2 mesh file (triangle cells only),
+    using read_su2_mesh_2d(). SU2 indices are already 0-based and
+    sequential, so no renumbering is needed. Each MARKER_TAG's
+    boundary line elements become edges, with a sequential integer
+    edge_id assigned per marker; marker_names maps edge_id back to
+    the original tag string.
+    """
+    su2_data = read_su2_mesh_2d(filepath)
+    pts = su2_data['points']
+    nodes = np.hstack([pts, np.zeros((pts.shape[0], 1))]) if pts.shape[1] == 2 else pts
+    triangles = su2_data['elems'].astype(int)
+
+    edge_list, edge_id_list, marker_names = [], [], {}
+    for marker_idx, (tag, conn) in enumerate(su2_data['markers'].items()):
+        marker_names[marker_idx] = tag
+        for row in conn:
+            edge_list.append(row)
+            edge_id_list.append(marker_idx)
+
+    edges = np.array(edge_list, dtype=int) if edge_list else np.empty((0, 2), dtype=int)
+    edge_ids = np.array(edge_id_list, dtype=int) if edge_id_list else np.empty((0,), dtype=int)
+
+    return TriMesh(nodes=nodes, triangles=triangles, edges=edges,
+               edge_ids=edge_ids) #, marker_names=marker_name)

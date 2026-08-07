@@ -8,6 +8,8 @@ Created on Sun Aug  2 10:54:03 2026
 
 import re
 import numpy as np
+from notboring2d.TriMesh import TriMesh
+from typing import Optional, Dict
 
 def _to_float(s):
     """Convert Nastran-style reals (e.g. '1.5-3' -> 1.5e-3) to float."""
@@ -171,3 +173,54 @@ def write_nastran_mesh(filepath, nodes, triangles, cbeams, header_comment=None):
 
     with open(filepath, 'w') as f:
         f.writelines(lines)
+        
+    
+# ---------- I/O interface: Nastran ----------
+def nastran_to_trimesh(filepath: str) -> "TriMesh":
+    """
+    Read GRID/CTRIA3/CBEAM cards, discard all Nastran IDs, and
+    renumber nodes/elements sequentially by sorted grid ID order.
+    CBEAM property IDs become edge_ids.
+    """
+    data = read_nastran_mesh(filepath)
+    gid_nodes, gid_tris, gid_beams = data['nodes'], data['triangles'], data['cbeams']
+
+    sorted_gids = sorted(gid_nodes.keys())
+    gid_to_idx = {gid: i for i, gid in enumerate(sorted_gids)}
+    nodes = np.array([gid_nodes[g] for g in sorted_gids], dtype=float)
+
+    sorted_eids = sorted(gid_tris.keys())
+    triangles = np.array(
+        [[gid_to_idx[g] for g in gid_tris[e]['nodes']] for e in sorted_eids], dtype=int
+    ) if sorted_eids else np.empty((0, 3), dtype=int)
+
+    sorted_beid = sorted(gid_beams.keys())
+    edges = np.array(
+        [[gid_to_idx[g] for g in gid_beams[e]['nodes']] for e in sorted_beid], dtype=int
+    ) if sorted_beid else np.empty((0, 2), dtype=int)
+    edge_ids = np.array(
+        [gid_beams[e]['pid'] for e in sorted_beid], dtype=int
+    ) if sorted_beid else np.empty((0,), dtype=int)
+
+    return TriMesh(nodes=nodes, triangles=triangles, edges=edges, edge_ids=edge_ids)
+
+def trimesh_to_nastran(triMesh: TriMesh, filepath: str, header_comment: Optional[str] = None) -> None:
+    """
+    Write to a Nastran file with fresh sequential 1-based IDs.
+    Since tri_pid is no longer stored, all CTRIA3 cards get PID=1.
+    """
+    nodes_dict = {i + 1: triMesh.nodes[i] for i in range(triMesh.n_nodes)}
+
+    triangles_dict = {}
+    for i in range(triMesh.n_triangles):
+        n1, n2, n3 = triMesh.triangles[i]
+        triangles_dict[i + 1] = {'pid': 1, 'nodes': (n1 + 1, n2 + 1, n3 + 1)}
+
+    cbeams_dict = {}
+    beam_eid_start = triMesh.n_triangles + 1
+    for i in range(triMesh.n_edges):
+        ga, gb = triMesh.edges[i]
+        cbeams_dict[beam_eid_start + i] = {'pid': int(triMesh.edge_ids[i]), 'nodes': (ga + 1, gb + 1)}
+
+    write_nastran_mesh(filepath, nodes_dict, triangles_dict, cbeams_dict,
+                       header_comment=header_comment)
