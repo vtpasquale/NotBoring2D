@@ -11,7 +11,7 @@ import pyvista as pv
 import numpy as np
 
 
-def trimesh_to_pyvista(mesh: "TriMesh") -> pv.UnstructuredGrid:
+def trimesh_to_pyvista(mesh: TriMesh) -> pv.UnstructuredGrid:
     """
     Convert a TriMesh into a PyVista UnstructuredGrid containing both the
     triangle (VTK_TRIANGLE) cells and the edge (VTK_LINE) cells in a single
@@ -63,63 +63,99 @@ def trimesh_to_pyvista(mesh: "TriMesh") -> pv.UnstructuredGrid:
 
     return grid
 
-def pyvista_to_trimesh(grid: pv.UnstructuredGrid, marker_names: dict = None) -> "TriMesh":
+
+def pyvista_to_trimesh(
+    grid: pv.UnstructuredGrid,
+    edge_id_field: str = "edge_id",
+    non_edge_value: int = -1,
+    cast_dtype=int,
+) -> TriMesh:
     """
-    Convert a PyVista UnstructuredGrid (as produced by trimesh_to_pyvista)
-    back into a TriMesh. Extracts VTK_TRIANGLE cells into `triangles` and
-    VTK_LINE cells into `edges`, reading edge IDs from the 'edge_id'
-    cell-data array (triangle cells are expected to carry -1 there).
+    Convert a PyVista UnstructuredGrid (as produced by trimesh_to_pyvista, or
+    any grid with triangle/line cells) back into a TriMesh, sourcing the
+    per-edge marker/ID values from an arbitrary cell-data field rather than
+    a hardcoded 'edge_id' array.
 
     Parameters
     ----------
     grid : pv.UnstructuredGrid
-        Grid containing triangle and/or line cells, with an 'edge_id'
-        cell-data array present if any line cells exist.
-    marker_names : dict, optional
-        Optional {edge_id: name} mapping to attach to the returned
-        TriMesh's `marker_names` attribute (not derivable from the grid
-        itself, since PyVista doesn't store a name-per-id map natively).
+        Grid containing triangle and/or line cells.
+    edge_id_field : str, default 'edge_id'
+        Name of the cell-data array to read edge identifiers from. The
+        array may be:
+          - integer-valued (used directly, after casting), or
+          - float-valued (rounded to nearest int), or
+          - string/object-valued categorical labels (each unique label is
+            mapped to an integer code, assigned in sorted order).
+        Triangle cells may carry any placeholder value in this field
+        (typically `non_edge_value`); it is ignored for triangles.
+    non_edge_value : int, default -1
+        The integer value used in `edge_id_field` to mark "this cell is not
+        an edge" (e.g. triangle cells), and the fallback used to fill any
+        non-finite (NaN/inf) entries encountered in a numeric field before
+        rounding/casting. Triangle rows are identified by VTK cell type,
+        not by this value, so it need only match whatever your upstream
+        code wrote.
+    cast_dtype : type, default int
+        Integer type to cast final edge IDs to.
 
     Returns
     -------
     TriMesh
     """
-    if 'edge_id' in grid.cell_data:
-        edge_id_field = np.asarray(grid.cell_data['edge_id'])
-    else:
-        edge_id_field = np.full(grid.n_cells, -1, dtype=int)
+    if not isinstance(non_edge_value, (int, np.integer)) or isinstance(non_edge_value, bool):
+        raise TypeError(
+            f"non_edge_value must be an int, got {type(non_edge_value).__name__}"
+        )
 
+    if edge_id_field not in grid.cell_data:
+        raise KeyError(
+            f"Field '{edge_id_field}' not found in grid.cell_data; "
+            f"available fields: {list(grid.cell_data.keys())}"
+        )
+
+    raw_field = np.asarray(grid.cell_data[edge_id_field])
     points = np.asarray(grid.points, dtype=float)
 
-    tri_rows = []
-    edge_rows = []
-    edge_id_rows = []
+    is_categorical = raw_field.dtype.kind in ("U", "S", "O")
 
-    for i in range(grid.n_cells):
-        cell = grid.get_cell(i)
-        ctype = cell.type
-        pt_ids = cell.point_ids
+    if is_categorical:
+        unique_labels = sorted(set(raw_field.tolist()), key=str)
+        label_to_code = {label: i for i, label in enumerate(unique_labels)}
+        edge_id_field_numeric = np.array(
+            [label_to_code[v] for v in raw_field.tolist()], dtype=cast_dtype
+        )
+    else:
+        numeric = raw_field.astype(float)
+        if np.any(~np.isfinite(numeric)):
+            numeric = np.where(np.isfinite(numeric), numeric, float(non_edge_value))
+        edge_id_field_numeric = np.rint(numeric).astype(cast_dtype)
 
-        if ctype == pv.CellType.TRIANGLE:
-            if len(pt_ids) != 3:
-                raise ValueError(f"Cell {i} is TRIANGLE type but has {len(pt_ids)} points")
-            tri_rows.append(pt_ids)
+    cells_dict = grid.cells_dict
+    tri_type = pv.CellType.TRIANGLE
+    line_type = pv.CellType.LINE
 
-        elif ctype == pv.CellType.LINE:
-            if len(pt_ids) != 2:
-                raise ValueError(f"Cell {i} is LINE type but has {len(pt_ids)} points")
-            edge_rows.append(pt_ids)
-            edge_id_rows.append(int(edge_id_field[i]))
+    supported_types = {tri_type, line_type}
+    present_types = set(cells_dict.keys())
+    unsupported = present_types - supported_types
+    if unsupported:
+        raise ValueError(
+            f"Grid contains unsupported VTK cell types {unsupported}; "
+            "pyvista_to_trimesh only supports TRIANGLE and LINE cells."
+        )
 
-        else:
-            raise ValueError(
-                f"Cell {i} has unsupported VTK cell type {ctype}; "
-                "pyvista_to_trimesh only supports TRIANGLE and LINE cells."
-            )
+    triangles = np.asarray(cells_dict.get(tri_type, np.empty((0, 3), dtype=int)), dtype=int)
+    edges = np.asarray(cells_dict.get(line_type, np.empty((0, 2), dtype=int)), dtype=int)
 
-    triangles = np.array(tri_rows, dtype=int) if tri_rows else np.empty((0, 3), dtype=int)
-    edges = np.array(edge_rows, dtype=int) if edge_rows else np.empty((0, 2), dtype=int)
-    edge_ids = np.array(edge_id_rows, dtype=int) if edge_id_rows else np.empty((0,), dtype=int)
+    celltypes = np.asarray(grid.celltypes)
+    line_mask = celltypes == line_type
+    edge_ids = edge_id_field_numeric[line_mask]
 
-    return TriMesh(nodes=points, triangles=triangles, edges=edges,
-                   edge_ids=edge_ids, marker_names=marker_names or {})
+    if len(edge_ids) != len(edges):
+        raise ValueError(
+            f"Mismatch between number of LINE cells ({len(edges)}) and "
+            f"extracted edge IDs ({len(edge_ids)}) from field "
+            f"'{edge_id_field}'; check that the field is well-formed."
+        )
+
+    return TriMesh(nodes=points, triangles=triangles, edges=edges, edge_ids=edge_ids)
